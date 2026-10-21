@@ -44,7 +44,7 @@ RELATION_STYLE: dict[str, tuple[str, bool]] = {
     "PUBLISHED_BY": ("#B07AA1", False),
     "CONTRIBUTED_BY": ("#B07AA1", True),
     "HAS_KEYWORD": ("#76B7B2", False),
-    "CO_CITED": ("#7F7F7F", False),
+    "CO_CITED": ("rgba(127,127,127,0.55)", False),
 }
 
 

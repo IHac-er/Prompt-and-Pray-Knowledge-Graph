@@ -9,7 +9,8 @@ Subcommands:
     path        Shortest co-citation & semantic paths between two datasets (+ --html)
     bridges     Top interdisciplinary bridge datasets (betweenness & cross-community)
     compare     Side-by-side structural & semantic comparison of two datasets
-    ask         Natural-language Graph-RAG question answering (100% local)
+    ask         Natural-language question answering: rule-based intent routing + graph
+                retrieval + templated answers (100% local, no LLM)
     repl        Interactive live shell (loads kg.pkl once for instant demo queries)
 
 Usage (from the project root):
@@ -24,13 +25,15 @@ Usage (from the project root):
 from __future__ import annotations
 
 import argparse
+import functools
+import itertools
 import logging
 import math
 import re
 import shlex
 import sys
 import webbrowser
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,6 +47,18 @@ from src.visualizer import Scene, Styler, _slug, add_edge, add_node, render
 log = logging.getLogger("graph_engine")
 
 METADATA_RELS = ("HAS_THEME", "HAS_KEYWORD", "CREATED_BY", "PUBLISHED_BY", "CONTRIBUTED_BY")
+
+# Keywords attached to very many datasets carry no meaning (e.g. the Kaggle size tags
+# "small", "medium", "featured") and would create false links, so they are ignored
+# when looking for semantic paths and recommendation evidence.
+GENERIC_KEYWORDS = {"small", "medium", "large", "featured"}
+GENERIC_KEYWORD_DEGREE = 50
+
+
+def is_generic_keyword(G: nx.MultiDiGraph, node: str) -> bool:
+    d = G.nodes[node]
+    return d["type"] == "Keyword" and (d["label"] in GENERIC_KEYWORDS
+                                       or G.in_degree(node) >= GENERIC_KEYWORD_DEGREE)
 
 
 # --------------------------------------------------------------------------- #
@@ -81,26 +96,33 @@ def resolve_dataset(G: nx.MultiDiGraph, query: str, verbose: bool = True) -> str
     """Resolve a free-text query, integer ID, or ``dataset:ID`` to a Dataset node."""
     hits = find_nodes(G, query, "Dataset", limit=5)
     if not hits:
-        kw_hits = search_datasets(G, query, limit=5)
-        if not kw_hits:
+        hits = search_datasets(G, query, limit=5)
+        if not hits:
             raise ValueError(f"No dataset matches '{query}'.")
-        hits = kw_hits
-    if verbose and len(hits) > 1 and hits[0][1] < 100.0:
-        print(f"Resolved '{query}' -> {G.nodes[hits[0][0]]['label']} [{hits[0][0]}] "
-              f"(other matches: {', '.join(f'{G.nodes[n]['label'][:30]} [{n}]' for n, _ in hits[1:4])})")
-    return hits[0][0]
+    best, score = hits[0]
+    if verbose:
+        title = G.nodes[best]["label"]
+        exact = [n for n, s in hits if s >= 100.0]
+        if len(exact) > 1:
+            print(f"Note: {len(exact)} datasets are titled '{title}'; "
+                  f"using the best-connected one [{best}].")
+        elif len(hits) > 1 and score < 100.0:
+            others = ", ".join(f"{G.nodes[n]['label'][:30]} [{n}]" for n, _ in hits[1:4])
+            print(f"Resolved '{query}' -> {title} [{best}] (other matches: {others})")
+    return best
 
 
 def _meta_sets(G: nx.MultiDiGraph, ds: str) -> tuple[set[str], set[str], set[str]]:
     """Return ``(fields, keywords, agents)`` neighbor node IDs for dataset ``ds``."""
     fields = set(out_by_rel(G, ds, "HAS_THEME"))
-    kws = set(out_by_rel(G, ds, "HAS_KEYWORD"))
+    kws = {k for k in out_by_rel(G, ds, "HAS_KEYWORD") if not is_generic_keyword(G, k)}
     agents = (set(out_by_rel(G, ds, "CREATED_BY"))
               | set(out_by_rel(G, ds, "PUBLISHED_BY"))
               | set(out_by_rel(G, ds, "CONTRIBUTED_BY")))
     return fields, kws, agents
 
 
+@functools.lru_cache(maxsize=2)
 def build_semantic_skeleton(G: nx.MultiDiGraph) -> nx.Graph:
     """Build an undirected bipartite/multipartite graph of all non-Paper nodes.
 
@@ -112,7 +134,7 @@ def build_semantic_skeleton(G: nx.MultiDiGraph) -> nx.Graph:
         if d["type"] != "Paper":
             S.add_node(n, **d)
     for u, v, k in G.edges(keys=True):
-        if k == "REFERENCED_BY":
+        if k == "REFERENCED_BY" or (k == "HAS_KEYWORD" and is_generic_keyword(G, v)):
             continue
         # Weight metadata hubs by log(degree) so specific links (creators/keywords)
         # are preferred over broad Field hubs when finding semantic paths.
@@ -143,12 +165,13 @@ def analyze_dataset_profile(G: nx.MultiDiGraph, H: nx.Graph, node: str) -> dict[
         for v, d in nbrs[:10]
     ]
 
-    # Removal Impact Analysis (Tutorial 354: downstream impact of removing a node)
-    # Check how many co-citation neighbors become completely isolated in H if `node` is removed,
-    # and how many distinct communities `node` directly bridges.
+    # Removal impact: which co-cited neighbors would lose their only co-citation link
+    # (become isolated in H), and which *other* communities this dataset is linked to.
     isolated_if_removed = [v for v, _ in nbrs if H.degree(v) == 1]
-    bridged_communities = sorted({G.nodes[v].get("community", -1) for v, _ in nbrs} - {-1})
-    Exclusive_papers = sum(1 for p in out_by_rel(G, node, "REFERENCED_BY") if G.in_degree(p) == 1)
+    own_comm = a.get("community", -1)
+    bridged_communities = sorted(
+        {G.nodes[v].get("community", -1) for v, _ in nbrs} - {-1, own_comm})
+    exclusive = sum(1 for p in out_by_rel(G, node, "REFERENCED_BY") if G.in_degree(p) == 1)
 
     return {
         "node": node,
@@ -163,8 +186,8 @@ def analyze_dataset_profile(G: nx.MultiDiGraph, H: nx.Graph, node: str) -> dict[
         "landing_pages": a.get("landing_pages", []),
         "description": a.get("description", ""),
         "n_papers": a.get("n_papers", 0),
-        "exclusive_papers": Exclusive_papers,
-        "shared_papers": a.get("n_papers", 0) - Exclusive_papers,
+        "exclusive_papers": exclusive,
+        "shared_papers": a.get("n_papers", 0) - exclusive,
         "community": a.get("community", -1),
         "pagerank": a.get("pagerank", 0.0),
         "degree_centrality": a.get("degree_centrality", 0.0),
@@ -219,8 +242,8 @@ def format_profile(prof: dict[str, Any]) -> str:
         "",
         "--- Removal Impact Analysis (Subgraph Criticality) ---",
         f"  Co-citation edges lost if removed       : {prof['co_cited_count']:,} edges "
-        f"({prof['weighted_degree']:,} paper-dataset bridge links)",
-        f"  Communities bridged by this dataset     : {len(prof['impact_bridged_communities'])} "
+        f"(summed shared-paper weight {prof['weighted_degree']:,})",
+        f"  Other communities co-cited with it      : {len(prof['impact_bridged_communities'])} "
         f"({prof['impact_bridged_communities']})",
         f"  Datasets disconnected from H if removed : {len(prof['impact_isolated_datasets'])}"
         + (f" -> {', '.join(prof['impact_isolated_datasets'][:5])}"
@@ -344,29 +367,38 @@ def format_recommendations(G: nx.MultiDiGraph, source: str, recs: list[Recommend
 # --------------------------------------------------------------------------- #
 # 3. Cross-Domain Path-Finder & Scene Builder
 # --------------------------------------------------------------------------- #
+def _best_cocite_path(H: nx.Graph, source: str, target: str) -> list[str]:
+    """Fewest-hop path in ``H``; among equally short paths the strongest one
+    (largest sum of log shared-paper counts). Empty list if not connected."""
+    if source not in H or target not in H:
+        return []
+    if source == target:
+        return [source]
+    try:
+        paths = list(itertools.islice(nx.all_shortest_paths(H, source, target), 300))
+    except nx.NetworkXNoPath:
+        return []
+    return max(paths, key=lambda p: sum(math.log1p(H[a][b]["weight"])
+                                        for a, b in zip(p, p[1:])))
+
+
 def find_cross_domain_paths(G: nx.MultiDiGraph, H: nx.Graph, source: str,
                             target: str) -> PathResult:
     """Find both the strongest co-citation path in ``H`` and the most specific
     metadata path in ``G`` between ``source`` and ``target``."""
     res = PathResult(source=source, target=target)
 
-    # 1. Co-citation path in H (edge cost = 1 / (1 + log1p(shared_papers)))
-    if source in H and target in H:
-        def _cocite_cost(u: str, v: str, d: dict) -> float:
-            return 1.0 / (1.0 + math.log1p(d.get("weight", 1)))
-
-        try:
-            cpath = nx.shortest_path(H, source=source, target=target, weight=_cocite_cost)
-            res.cocite_path = cpath
-            for a, b in zip(cpath, cpath[1:]):
-                d = H[a][b]
-                res.cocite_hops.append({
-                    "u": a, "v": b,
-                    "u_label": G.nodes[a]["label"], "v_label": G.nodes[b]["label"],
-                    "weight": d["weight"], "jaccard": d.get("jaccard", 0.0),
-                })
-        except nx.NetworkXNoPath:
-            pass
+    # 1. Co-citation path in H: fewest hops, strongest links as tie-breaker
+    cpath = _best_cocite_path(H, source, target)
+    if cpath:
+        res.cocite_path = cpath
+        for a, b in zip(cpath, cpath[1:]):
+            d = H[a][b]
+            res.cocite_hops.append({
+                "u": a, "v": b,
+                "u_label": G.nodes[a]["label"], "v_label": G.nodes[b]["label"],
+                "weight": d["weight"], "jaccard": d.get("jaccard", 0.0),
+            })
 
     # 2. Heterogeneous semantic path in G (via Fields, Keywords, Persons, Orgs)
     S = build_semantic_skeleton(G)
@@ -426,34 +458,36 @@ def scene_path(G: nx.MultiDiGraph, H: nx.Graph, res: PathResult) -> Scene:
     sc = Scene(f"Path: {s_lab} <-> {t_lab}")
 
     path_nodes = set(res.cocite_path) | set(res.semantic_path) | {res.source, res.target}
-    for n in path_nodes:
+    for n in sorted(path_nodes):
         add_node(sc, st, n, center=(n in (res.source, res.target)))
 
-    # Add context metadata around each dataset on the path
-    for n in list(path_nodes):
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    def _draw(u: str, v: str, rel: str, weight: int | None = None,
+              jaccard: float | None = None) -> None:
+        """Draw each (u, v, relation) at most once."""
+        key = (min(u, v), max(u, v), rel) if rel == "CO_CITED" else (u, v, rel)
+        if key not in seen_edges:
+            seen_edges.add(key)
+            add_edge(sc, u, v, rel, weight, jaccard)
+
+    # Context metadata around each dataset on the path
+    for n in sorted(path_nodes):
         if G.nodes[n]["type"] == "Dataset":
             for f in out_by_rel(G, n, "HAS_THEME")[:2]:
                 add_node(sc, st, f)
-                add_edge(sc, n, f, "HAS_THEME")
+                _draw(n, f, "HAS_THEME")
             for c in out_by_rel(G, n, "CREATED_BY")[:2]:
                 add_node(sc, st, c)
-                add_edge(sc, n, c, "CREATED_BY")
+                _draw(n, c, "CREATED_BY")
 
-    seen_edges: set[tuple[str, str, str]] = set()
     for h in res.cocite_hops:
-        u, v = h["u"], h["v"]
-        key = (min(u, v), max(u, v), "CO_CITED")
-        if key not in seen_edges:
-            add_edge(sc, u, v, "CO_CITED", h["weight"], h["jaccard"])
-            seen_edges.add(key)
+        _draw(h["u"], h["v"], "CO_CITED", h["weight"], h["jaccard"])
 
     for u, v, rel in res.semantic_edges:
-        # Ensure edge direction matches Dataset -> Metadata in G
+        # semantic edges always run Dataset -> metadata in G
         src, dst = (u, v) if G.nodes[u]["type"] == "Dataset" else (v, u)
-        key = (src, dst, rel)
-        if key not in seen_edges:
-            add_edge(sc, src, dst, rel)
-            seen_edges.add(key)
+        _draw(src, dst, rel)
 
     sc.notes.append("Highlighted endpoints have bold borders. Grey lines = shared papers; "
                     "colored lines = semantic metadata links.")
@@ -463,16 +497,23 @@ def scene_path(G: nx.MultiDiGraph, H: nx.Graph, res: PathResult) -> Scene:
 # --------------------------------------------------------------------------- #
 # 4. Interdisciplinary Bridge Detector
 # --------------------------------------------------------------------------- #
+@functools.lru_cache(maxsize=2)
+def _sampled_betweenness(H: nx.Graph) -> dict[str, float]:
+    return nx.betweenness_centrality(H, k=min(350, H.number_of_nodes()), weight=None, seed=42)
+
+
+def _betweenness(G: nx.MultiDiGraph, H: nx.Graph) -> dict[str, float]:
+    """Stored betweenness (build ``--betweenness``) or a cached sampled estimate."""
+    sample = next(iter(H), None)
+    if sample and G.nodes[sample].get("betweenness") is not None:
+        return {n: (G.nodes[n].get("betweenness") or 0.0) for n in H}
+    return _sampled_betweenness(H)
+
+
 def find_bridge_datasets(G: nx.MultiDiGraph, H: nx.Graph, field_query: str | None = None,
                          top: int = 15) -> list[dict[str, Any]]:
     """Identify datasets that act as bridges across communities and fields."""
-    # Compute exact or sampled betweenness centrality on H if not already stored
-    sample_node = next(iter(H), None)
-    if sample_node and G.nodes[sample_node].get("betweenness") is not None:
-        bet = {n: (G.nodes[n].get("betweenness") or 0.0) for n in H}
-    else:
-        k = min(350, H.number_of_nodes())
-        bet = nx.betweenness_centrality(H, k=k, weight=None, seed=42)
+    bet = _betweenness(G, H)
 
     allowed_ds: set[str] | None = None
     if field_query:
@@ -495,7 +536,6 @@ def find_bridge_datasets(G: nx.MultiDiGraph, H: nx.Graph, field_query: str | Non
         cross_ratio = cross_edges / deg
         fields = [G.nodes[f]["label"] for f in out_by_rel(G, d, "HAS_THEME")]
 
-        bridge_score = 100.0 * bet.get(d, 0.0) + 0.15 * len(nbr_comms) + 0.5 * cross_ratio
         rows.append({
             "node": d,
             "label": G.nodes[d]["label"],
@@ -506,7 +546,6 @@ def find_bridge_datasets(G: nx.MultiDiGraph, H: nx.Graph, field_query: str | Non
             "n_papers": G.nodes[d].get("n_papers", 0),
             "community": my_comm,
             "fields": "; ".join(fields) if fields else "Untagged",
-            "bridge_score": bridge_score,
         })
 
     rows.sort(key=lambda r: (-r["betweenness"], -r["n_communities_linked"], -r["degree_H"]))
@@ -575,115 +614,165 @@ def compare_datasets(G: nx.MultiDiGraph, H: nx.Graph, ds_a: str, ds_b: str) -> s
 # --------------------------------------------------------------------------- #
 # 6. Local Graph-RAG / Natural-Language Question Answering Engine
 # --------------------------------------------------------------------------- #
-def _extract_quoted_or_known_datasets(G: nx.MultiDiGraph, question: str) -> list[str]:
-    """Identify Dataset nodes mentioned in a natural-language question."""
-    found: list[str] = []
-    # 1. Explicit dataset:ID mentions
-    for m in re.finditer(r"\bdataset:\d+\b", question.lower()):
-        if m.group(0) in G:
-            found.append(m.group(0))
-    # 2. Quoted strings ("ImageNet", 'GenBank')
-    for m in re.finditer(r'["\']([^"\']{2,60})["\']', question):
-        hits = find_nodes(G, m.group(1), "Dataset", limit=1)
-        if hits and hits[0][0] not in found:
-            found.append(hits[0][0])
-    if len(found) >= 2:
-        return found
+_GENERIC_TITLES = {"data", "dataset", "small", "large", "scope"}
+_QUESTION_STOP = {
+    "which", "what", "who", "whom", "whose", "where", "when", "how", "why", "are", "is",
+    "was", "were", "do", "does", "did", "can", "could", "should", "would", "will", "show",
+    "me", "find", "give", "list", "tell", "about", "datasets", "dataset", "data", "there",
+    "any", "some", "all", "top", "best", "most", "used", "use", "using", "for", "from",
+    "that", "this", "these", "those", "have", "has", "i", "we", "you", "please", "on",
+    "in", "of", "the", "a", "an", "and", "or", "to", "with", "by", "s"}
 
-    # 3. Scan capitalized / multi-word phrases or known major dataset titles
-    q_norm = f" {normalize_text(question)} "
-    candidates: list[tuple[int, int, str]] = []
-    for d in dataset_nodes(G):
-        lab_norm = normalize_text(G.nodes[d]["label"])
-        if len(lab_norm) < 4 or lab_norm in {"data", "dataset", "small", "large", "scope"}:
-            continue
-        if f" {lab_norm} " in q_norm:
-            candidates.append((len(lab_norm), G.nodes[d].get("n_papers", 0), d))
-    candidates.sort(reverse=True)
-    for _, _, d in candidates:
-        if d not in found:
-            found.append(d)
-    return found[:3]
+
+def _has_intent(q_low: str, stems: tuple[str, ...], exact: tuple[str, ...] = ()) -> bool:
+    """True if any stem starts a word in ``q_low`` (or any ``exact`` word appears)."""
+    if any(re.search(r"\b" + re.escape(st), q_low) for st in stems):
+        return True
+    return any(re.search(r"\b" + re.escape(w) + r"\b", q_low) for w in exact)
+
+
+@functools.lru_cache(maxsize=2)
+def _field_nodes(G: nx.MultiDiGraph) -> tuple[tuple[str, str, str], ...]:
+    return tuple((n, d["label"], normalize_text(d["label"]))
+                 for n, d in G.nodes(data=True) if d["type"] == "Field")
+
+
+def _fields_in_question(G: nx.MultiDiGraph, question: str) -> list[tuple[str, str]]:
+    """Fields of study named in ``question`` as whole words, longest name first."""
+    q = f" {normalize_text(question)} "
+    hits = [(n, label, norm) for n, label, norm in _field_nodes(G)
+            if norm and f" {norm} " in q]
+    hits.sort(key=lambda t: -len(t[2]))
+    return [(n, label) for n, label, _ in hits]
+
+
+def _extract_quoted_or_known_datasets(G: nx.MultiDiGraph, question: str) -> list[str]:
+    """Dataset nodes mentioned in ``question``, in the order they appear.
+
+    Sources: explicit ``dataset:ID``; quoted names (fuzzy match, score >= 80); and
+    titles found verbatim in the text. Longer titles win over titles they contain,
+    and datasets with identical titles collapse to the best-connected one.
+    """
+    low = question.lower()
+    positions: dict[str, int] = {}
+    spans: list[tuple[int, int]] = []
+    for m in re.finditer(r"\bdataset:\d+\b", low):
+        node = m.group(0)
+        if node in G and G.nodes[node]["type"] == "Dataset":
+            positions.setdefault(node, m.start())
+            spans.append(m.span())
+    # quotes must not sit inside a word, so the apostrophe in "What's" is not a quote
+    for m in re.finditer(r"""(?<!\w)(["'])(.{2,60}?)\1(?!\w)""", question):
+        hits = find_nodes(G, m.group(2), "Dataset", limit=1)
+        if hits and hits[0][1] >= 80.0:
+            positions.setdefault(hits[0][0], m.start())
+            spans.append(m.span())
+
+    if len(positions) < 2:
+        tokens = set(normalize_text(question).split())
+        best: dict[str, str] = {}
+        for d in dataset_nodes(G):
+            lab = normalize_text(G.nodes[d]["label"])
+            if len(lab) < 4 or lab in _GENERIC_TITLES or lab.split()[0] not in tokens:
+                continue
+            cur = best.get(lab)
+            if cur is None or G.nodes[d].get("n_papers", 0) > G.nodes[cur].get("n_papers", 0):
+                best[lab] = d
+        for lab, d in sorted(best.items(), key=lambda kv: -len(kv[0])):
+            pat = r"(?<!\w)" + r"[\W_]+".join(map(re.escape, lab.split())) + r"(?!\w)"
+            m = re.search(pat, low)
+            if not m or any(m.start() < e and s < m.end() for s, e in spans):
+                continue
+            spans.append(m.span())
+            positions.setdefault(d, m.start())
+
+    unique: list[str] = []
+    seen_titles: set[str] = set()
+    for d in sorted(positions, key=positions.get):
+        title = normalize_text(G.nodes[d]["label"])
+        if title not in seen_titles:
+            seen_titles.add(title)
+            unique.append(d)
+    return unique[:3]
+
+
+_COMPARE_WORDS = ("compar", "differ", "versus", "similar", "in common")
+_PATH_WORDS = ("connect", "path", "link", "relat", "bridge", "route")
+_RECOMMEND_WORDS = ("recommend", "similar", "related", "co-cit", "cocit", "suggest",
+                    "alternative", "complement", "novel", "predict")
+_NOVEL_WORDS = ("novel", "predict", "unconnected", "undiscovered")
+_BRIDGE_WORDS = ("bridge", "interdisciplinary", "betweenness", "cross-domain", "cross domain")
 
 
 def answer_question(G: nx.MultiDiGraph, H: nx.Graph, question: str) -> str:
-    """Route a natural-language question to the appropriate graph traversal
-    routine and synthesize a grounded, fact-checked answer."""
+    """Answer a natural-language question from the graph.
+
+    Rule-based intent routing -> graph retrieval -> templated answer. No LLM is
+    involved: every number and name in the answer is read from the graph.
+    """
     q_low = question.lower().strip()
-    mentioned_ds = _extract_quoted_or_known_datasets(G, question)
+    mentioned = _extract_quoted_or_known_datasets(G, question)
+    fields = _fields_in_question(G, question)
+    header = ["=" * 78, f"GRAPH QUERY: {question}", "=" * 78]
 
-    header = [
-        "=" * 78,
-        f"GRAPH-RAG QUERY: {question}",
-        "=" * 78,
-    ]
+    def out(*body: str) -> str:
+        return "\n".join(header + list(body))
 
-    # Intent A: Path / Connection between two datasets
-    if len(mentioned_ds) >= 2 and any(w in q_low for w in ("connect", "path", "link", "between", "relate", "bridge")):
-        d1, d2 = mentioned_ds[0], mentioned_ds[1]
-        res = find_cross_domain_paths(G, H, d1, d2)
-        return "\n".join(header + [format_path_result(G, res)])
+    # Two datasets: comparison (default) or path/connection
+    if len(mentioned) >= 2:
+        d1, d2 = mentioned[0], mentioned[1]
+        if not _has_intent(q_low, _COMPARE_WORDS, exact=("vs",)) and \
+                _has_intent(q_low, _PATH_WORDS):
+            return out(format_path_result(G, find_cross_domain_paths(G, H, d1, d2)))
+        return out(compare_datasets(G, H, d1, d2))
 
-    # Intent B: Comparison between two datasets
-    if len(mentioned_ds) >= 2 and any(w in q_low for w in ("compare", "vs", "versus", "difference", "similar")):
-        d1, d2 = mentioned_ds[0], mentioned_ds[1]
-        return "\n".join(header + [compare_datasets(G, H, d1, d2)])
+    # One dataset: recommendations / similar datasets
+    if mentioned and _has_intent(q_low, _RECOMMEND_WORDS):
+        novel = _has_intent(q_low, _NOVEL_WORDS)
+        recs = recommend_datasets(G, H, mentioned[0], top=8, novel_only=novel)
+        return out(format_recommendations(G, mentioned[0], recs, novel_only=novel))
 
-    # Intent C: Recommendations / similar datasets for a mentioned dataset
-    if mentioned_ds and any(w in q_low for w in ("recommend", "similar", "like", "co-cit", "cocit", "related", "with")):
-        target = mentioned_ds[0]
-        novel = "novel" in q_low or "predict" in q_low or "unconnected" in q_low
-        recs = recommend_datasets(G, H, target, top=8, novel_only=novel)
-        return "\n".join(header + [format_recommendations(G, target, recs, novel_only=novel)])
+    # Bridge datasets (overall or inside a field)
+    if _has_intent(q_low, _BRIDGE_WORDS):
+        fq = fields[0][1] if fields else None
+        return out(format_bridges(find_bridge_datasets(G, H, field_query=fq, top=10), fq))
 
-    # Intent D: Bridge datasets (overall or within a field)
-    if any(w in q_low for w in ("bridge", "interdisciplinary", "betweenness", "cross-domain")):
-        field_match = None
-        for n, d in G.nodes(data=True):
-            if d["type"] == "Field" and d["label"].lower() in q_low:
-                field_match = d["label"]
-                break
-        rows = find_bridge_datasets(G, H, field_query=field_match, top=10)
-        return "\n".join(header + [format_bridges(rows, field_query=field_match)])
+    # One dataset: profile / impact
+    if len(mentioned) == 1:
+        return out(format_profile(analyze_dataset_profile(G, H, mentioned[0])))
 
-    # Intent E: Single dataset profile / impact question
-    if len(mentioned_ds) == 1:
-        prof = analyze_dataset_profile(G, H, mentioned_ds[0])
-        return "\n".join(header + [format_profile(prof)])
+    # A field of study: its top datasets
+    if fields:
+        fid, flabel = fields[0]
+        ds_list = [u for u, _, k in G.in_edges(fid, keys=True) if k == "HAS_THEME"]
+        ds_list.sort(key=lambda x: -G.nodes[x].get("n_papers", 0))
+        lines = [f"Matched field of study: {flabel} [{fid}] ({len(ds_list)} datasets in DSKG)",
+                 "", f"Top 10 datasets in {flabel} by referencing papers:"]
+        for i, ds in enumerate(ds_list[:10], 1):
+            a = G.nodes[ds]
+            lines.append(f"  {i:>2}. {a['label'][:42]:<42} [{ds:<12}] "
+                         f"{a['n_papers']:>8,} papers  PageRank={a['pagerank']:.5f}  "
+                         f"(C{a['community']})")
+        return out(*lines)
 
-    # Intent F: Field or topic search + subgraph summary
-    for n, d in G.nodes(data=True):
-        if d["type"] == "Field" and d["label"].lower() in q_low:
-            ds_list = [u for u, _, k in G.in_edges(n, keys=True) if k == "HAS_THEME"]
-            ds_list.sort(key=lambda x: -G.nodes[x].get("n_papers", 0))
-            lines = header + [
-                f"Matched Field of Study: {d['label']} [{n}] ({len(ds_list)} datasets in DSKG)",
-                "",
-                f"Top 10 Datasets in {d['label']} by Referencing Papers:",
-            ]
-            for i, ds in enumerate(ds_list[:10], 1):
-                a = G.nodes[ds]
-                lines.append(f"  {i:>2}. {a['label'][:42]:<42} [{ds:<12}] "
-                             f"{a['n_papers']:>8,} papers  PageRank={a['pagerank']:.5f}  (C{a['community']})")
-            return "\n".join(lines)
-
-    # Fallback: Keyword search across dataset titles, keywords, fields, descriptions
-    hits = search_datasets(G, question, limit=10)
+    # Fallback: keyword search over titles, keywords, fields and descriptions
+    cleaned = " ".join(t for t in normalize_text(question).split() if t not in _QUESTION_STOP)
+    hits = search_datasets(G, cleaned or question, limit=10)
     if hits:
-        lines = header + [f"Top {len(hits)} Datasets Matching Query Semantics:"]
-        for i, (ds, score) in enumerate(hits, 1):
+        lines = [f"Top {len(hits)} datasets matching '{cleaned or question}':"]
+        for i, (ds, _score) in enumerate(hits, 1):
             a = G.nodes[ds]
             flds = ", ".join(G.nodes[f]["label"] for f in out_by_rel(G, ds, "HAS_THEME"))
             lines.append(f"  {i:>2}. {a['label'][:40]:<40} [{ds:<12}] "
-                         f"{a['n_papers']:>7,} papers  (C{a['community']})  Fields: {flds or 'N/A'}")
-        top_prof = analyze_dataset_profile(G, H, hits[0][0])
-        lines += ["", "--- Detailed Profile of Best Match ---", format_profile(top_prof)]
-        return "\n".join(lines)
+                         f"{a['n_papers']:>7,} papers  (C{a['community']})  "
+                         f"Fields: {flds or 'N/A'}")
+        lines += ["", "--- Detailed profile of the best match ---",
+                  format_profile(analyze_dataset_profile(G, H, hits[0][0]))]
+        return out(*lines)
 
-    return "\n".join(header + [
-        "No matching entities found. Try mentioning a dataset (e.g. 'ImageNet', 'GenBank'), "
-        "a field (e.g. 'Computer science', 'Biology'), or asking for 'bridge datasets'."
-    ])
+    return out("No matching entities found. Try mentioning a dataset (e.g. 'ImageNet', "
+               "'GenBank'), a field (e.g. 'Computer science', 'Biology'), or asking for "
+               "'bridge datasets'.")
 
 
 # --------------------------------------------------------------------------- #

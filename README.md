@@ -31,10 +31,27 @@ open it in the browser). Loading the graph takes a few seconds per command.
     python -m src.visualizer field "Economics"
     python -m src.visualizer search "protein structure"
 
+Layout tuning: add `--spacing 1.5` (or 2) to spread nodes further apart, or
+`--spacing 0.8` to pull them closer. It works on every view, e.g.
+
+    python -m src.visualizer map --spacing 1.5 --open
+
 If PowerShell reports an encoding error while writing the page, run
 `$env:PYTHONUTF8=1` first, then repeat the command.
+
+## Stage 4 - query engine
+
+    python -m src.graph_engine profile "ImageNet"
+    python -m src.graph_engine recommend "ImageNet" --top 10
+    python -m src.graph_engine recommend "GenBank" --novel
+    python -m src.graph_engine path "ImageNet" "GenBank" --html --open
+    python -m src.graph_engine bridges --field "Computer science"
+    python -m src.graph_engine compare "ImageNet" "CIFAR-10"
+    python -m src.graph_engine ask "How are ImageNet and CIFAR-10 connected?"
+    python -m src.graph_engine repl        # loads the graph once, then instant queries
 
 ## Tests
 
     python tests\test_graph_builder.py
     python tests\test_visualizer.py
+    python tests\test_graph_engine.py

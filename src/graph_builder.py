@@ -339,7 +339,7 @@ def build_graph(raw: RawData, field_labels: dict[str, str] | None = None,
             contact=contact,
         )
 
-        for paper_uri in props.get("isReferencedBy", []) + raw.paper_links.get(ds_uri, []):
+        for paper_uri in raw.paper_links.get(ds_uri, []):
             pid = f"paper:{uri_tail(paper_uri)}"
             if pid not in G:
                 G.add_node(pid, type="Paper")

@@ -30,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import html
 import json
 import logging
@@ -182,7 +183,7 @@ def add_edge(scene: Scene, u: str, v: str, rel: str, weight: int | None = None,
         w = weight or 1
         scene.edges.append(dict(
             src=u, dst=v, color=color, dashes=False,
-            width=round(1 + 1.6 * math.log10(1 + w), 2), label=f"{w:,}",
+            width=round(0.8 + math.log10(1 + w), 2), label=f"{w:,}",
             title=f"Co-cited: {w:,} shared paper(s), Jaccard {jaccard or 0:.3f}",
             arrows={"to": {"enabled": False}}))
     else:
@@ -261,7 +262,7 @@ def scene_overview(G: nx.MultiDiGraph, H: nx.Graph, max_edges: int = 150,
     for (a, b), w in agg.most_common(max_edges):
         sc.edges.append(dict(
             src=f"community:{a}", dst=f"community:{b}", color="#9E9E9E", dashes=False,
-            width=round(1 + 1.6 * math.log10(1 + w), 2), label="",
+            width=round(0.8 + math.log10(1 + w), 2), label="",
             title=f"C{a} <-> C{b}: {w:,} co-citation weight",
             arrows={"to": {"enabled": False}}))
     if with_fields:
@@ -422,38 +423,59 @@ def scene_search(G, H, text: str, top: int = 25) -> Scene:
 # --------------------------------------------------------------------------- #
 # Rendering (PyVis) and in-page controls
 # --------------------------------------------------------------------------- #
+# Layout notes: a more negative gravitationalConstant pushes nodes apart, a larger
+# springLength lengthens edges, avoidOverlap keeps node bodies from touching.
+# The white label outline keeps text readable where it crosses lines.
+_LABEL_FONT = {"size": 14, "strokeWidth": 3, "strokeColor": "#ffffff"}
+
 VIS_OPTIONS = {
-    "nodes": {"font": {"size": 14}, "borderWidth": 1},
-    "edges": {"smooth": {"type": "continuous"}, "font": {"size": 10, "align": "middle"}},
+    "nodes": {"font": _LABEL_FONT, "borderWidth": 1},
+    "edges": {"smooth": {"type": "continuous"}, "arrows": {"to": {"scaleFactor": 0.5}},
+              "font": {"size": 10, "align": "middle", "strokeWidth": 3,
+                       "strokeColor": "#ffffff"}},
     "physics": {"solver": "forceAtlas2Based",
-                "forceAtlas2Based": {"gravitationalConstant": -70, "springLength": 120,
-                                     "avoidOverlap": 0.4},
-                "stabilization": {"iterations": 250}},
+                "forceAtlas2Based": {"gravitationalConstant": -180, "centralGravity": 0.004,
+                                     "springLength": 220, "springConstant": 0.05,
+                                     "damping": 0.5, "avoidOverlap": 1.0},
+                "stabilization": {"iterations": 300}},
     "interaction": {"hover": True, "tooltipDelay": 80, "navigationButtons": True,
                     "keyboard": True},
 }
 
 BIG_OPTIONS = {
-    "nodes": {"font": {"size": 12}, "borderWidth": 1},
-    "edges": {"smooth": False},
+    "nodes": {"font": {**_LABEL_FONT, "size": 12}, "borderWidth": 1},
+    "edges": {"smooth": False, "arrows": {"to": {"scaleFactor": 0.4}}},
     "layout": {"improvedLayout": False},
     "physics": {"solver": "barnesHut",
-                "barnesHut": {"gravitationalConstant": -4500, "springLength": 110,
-                              "springConstant": 0.03, "avoidOverlap": 0.2},
-                "stabilization": {"iterations": 150, "updateInterval": 25}},
+                "barnesHut": {"gravitationalConstant": -14000, "centralGravity": 0.12,
+                              "springLength": 170, "springConstant": 0.025,
+                              "damping": 0.2, "avoidOverlap": 0.6},
+                "stabilization": {"iterations": 250, "updateInterval": 25}},
     "interaction": {"hover": True, "tooltipDelay": 80, "navigationButtons": True,
                     "keyboard": True, "hideEdgesOnDrag": True, "hideEdgesOnZoom": True},
 }
 
 
-def vis_options(scene: Scene) -> dict:
-    """Light-weight physics for pages with many nodes."""
-    return BIG_OPTIONS if len(scene.nodes) > 600 else VIS_OPTIONS
+def vis_options(scene: Scene, spacing: float = 1.0) -> dict:
+    """Layout options for ``scene``; ``spacing`` > 1 spreads nodes further apart.
+
+    Pages with many nodes get the lighter barnesHut solver.
+    """
+    opts = copy.deepcopy(BIG_OPTIONS if len(scene.nodes) > 600 else VIS_OPTIONS)
+    phys = opts["physics"]
+    solver = phys[phys["solver"]]
+    solver["gravitationalConstant"] = round(solver["gravitationalConstant"] * spacing)
+    solver["springLength"] = round(solver["springLength"] * spacing)
+    return opts
 
 
 _PANEL_JS = """
 <script>
 (function () {
+  if (__FREEZE__) {   // big page: stop the physics once the layout has settled
+    try { network.once('stabilizationIterationsDone', function () {
+      network.setOptions({physics: {enabled: false}}); }); } catch (err) {}
+  }
   var box = document.getElementById('kg-search'), status = document.getElementById('kg-status');
   if (!box) return;
   box.addEventListener('keydown', function (e) {
@@ -506,11 +528,12 @@ def inject_controls(page: str, scene: Scene) -> str:
         '<div id="kg-status" style="color:#666;min-height:14px"></div>'
         '<div style="font-weight:bold;margin-top:6px">Show / hide</div>'
         f'{rows}{notes}</div>')
-    block = panel + _PANEL_JS
+    freeze = "true" if len(scene.nodes) > 600 else "false"
+    block = panel + _PANEL_JS.replace("__FREEZE__", freeze)
     return page.replace("</body>", block + "</body>", 1) if "</body>" in page else page + block
 
 
-def _build_net(scene: Scene, cdn: str):
+def _build_net(scene: Scene, cdn: str, spacing: float = 1.0):
     from pyvis.network import Network  # imported lazily: only needed to render
     net = Network(height="900px", width="100%", bgcolor="#ffffff", font_color="#222222",
                   directed=True, select_menu=True, cdn_resources=cdn)
@@ -522,24 +545,24 @@ def _build_net(scene: Scene, cdn: str):
         if not show_labels:
             opts.pop("label", None)
         net.add_edge(e["src"], e["dst"], **opts)
-    net.set_options("var options = " + json.dumps(vis_options(scene)))
+    net.set_options("var options = " + json.dumps(vis_options(scene, spacing)))
     return net
 
 
-def render(scene: Scene, path: Path, offline: bool = True) -> Path:
+def render(scene: Scene, path: Path, offline: bool = True, spacing: float = 1.0) -> Path:
     """Write ``scene`` to a self-contained HTML file at ``path``."""
     try:
         import pyvis  # noqa: F401
     except ImportError as exc:
         raise RuntimeError("pyvis is not installed. Run: pip install -r requirements.txt") from exc
     try:
-        net = _build_net(scene, "in_line" if offline else "remote")
+        net = _build_net(scene, "in_line" if offline else "remote", spacing)
         page = net.generate_html()
     except UnicodeDecodeError:
         print("WARNING: could not inline the JavaScript libraries (Windows encoding). "
               "Falling back to online libraries - the page needs internet to open. "
               "To fix: run  $env:PYTHONUTF8=1  in PowerShell first.", file=sys.stderr)
-        page = _build_net(scene, "remote").generate_html()
+        page = _build_net(scene, "remote", spacing).generate_html()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(inject_controls(page, scene), encoding="utf-8")
     return path
@@ -560,6 +583,8 @@ def build_parser() -> argparse.ArgumentParser:
         kw = (lambda d: {"default": d}) if defaults else (lambda d: {})
         parser.add_argument("--graph", type=Path, **kw(Path("data/processed/kg.pkl")))
         parser.add_argument("--out", type=Path, **kw(Path("output")))
+        parser.add_argument("--spacing", type=float, **kw(1.0),
+                            help="node spacing multiplier (try 1.5 or 2 for more room)")
         parser.add_argument("--open", action="store_true",
                             **({} if defaults else {"default": argparse.SUPPRESS}),
                             help="open the page in the browser")
@@ -632,7 +657,8 @@ def main(argv: list[str] | None = None) -> int:
             scene, name = scene_field(G, H, args.name, args.top), f"field-{_slug(args.name)}"
         else:
             scene, name = scene_search(G, H, args.text, args.top), f"search-{_slug(args.text)}"
-        out = render(scene, args.out / f"{name}.html", offline=not args.cdn)
+        out = render(scene, args.out / f"{name}.html", offline=not args.cdn,
+                     spacing=args.spacing)
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
