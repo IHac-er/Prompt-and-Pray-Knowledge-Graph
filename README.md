@@ -49,9 +49,3 @@ If PowerShell reports an encoding error while writing the page, run
     python -m src.graph_engine compare "ImageNet" "CIFAR-10"
     python -m src.graph_engine ask "How are ImageNet and CIFAR-10 connected?"
     python -m src.graph_engine repl        # loads the graph once, then instant queries
-
-## Tests
-
-    python tests\test_graph_builder.py
-    python tests\test_visualizer.py
-    python tests\test_graph_engine.py
